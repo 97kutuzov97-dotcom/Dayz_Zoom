@@ -107,6 +107,23 @@ user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
 user32.DestroyWindow.restype = wintypes.BOOL
 user32.DestroyWindow.argtypes = [wintypes.HWND]
 
+try:
+    user32.GetWindowLongPtrW.restype = ctypes.c_void_p
+    user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+    GetWindowLong = user32.GetWindowLongPtrW
+
+    user32.SetWindowLongPtrW.restype = ctypes.c_void_p
+    user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+    SetWindowLong = user32.SetWindowLongPtrW
+except AttributeError:
+    user32.GetWindowLongW.restype = wintypes.LONG
+    user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+    GetWindowLong = user32.GetWindowLongW
+
+    user32.SetWindowLongW.restype = wintypes.LONG
+    user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.LONG]
+    SetWindowLong = user32.SetWindowLongW
+
 user32.GetSystemMetrics.restype = ctypes.c_int
 user32.GetSystemMetrics.argtypes = [ctypes.c_int]
 
@@ -227,8 +244,8 @@ def create_reticle():
     reticle_window.update_idletasks()
     # Сделать окно сквозным для кликов (WS_EX_TRANSPARENT | WS_EX_LAYERED)
     hwnd = reticle_window.winfo_id()
-    style = user32.GetWindowLongW(hwnd, -20)
-    user32.SetWindowLongW(hwnd, -20, style | 0x20 | 0x80000)
+    style = GetWindowLong(hwnd, -20)
+    SetWindowLong(hwnd, -20, style | 0x20 | 0x80000)
 
     size = config["mag_size"]
     canvas = tk.Canvas(reticle_window, width=size, height=size,
@@ -611,11 +628,8 @@ def update_config(key, value):
     elif key == "smoothing_enabled":
         if h_magnifier:
             if value:
-                # Включить сглаживание (по умолчанию)
-                # К сожалению, MagSetWindowFilterList с NULL для сброса фильтра может не работать
-                # как ожидается для включения, но обычно оно включено по умолчанию.
-                # Пересоздание окна - надежный способ.
                 destroy_magnifier()
+                if need_zoom: show_magnifier()
             else:
                 mag_dll.MagSetWindowFilterList(h_magnifier, 0, 0, None)
     elif key == "mag_size":
