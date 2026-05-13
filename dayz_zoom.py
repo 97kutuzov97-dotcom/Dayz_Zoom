@@ -10,6 +10,7 @@ import tkinter as tk
 from tkinter import ttk
 import pystray
 from pystray import MenuItem as Item
+import winsound
 
 # ==================== ГЛОБАЛЬНЫЕ НАСТРОЙКИ ====================
 CONFIG_FILE = "dayz_zoom_config.json"
@@ -25,16 +26,21 @@ DEFAULT_CONFIG = {
     "reticle_visible": True,
     "reticle_alpha": 30,
     "reticle_color": "#808080",
+    "reticle_type": "cross",
+    "mag_size": 400,
+    "window_title": "DayZ",
+    "audio_enabled": True,
+    "freeze_key": "f3",
+    "smoothing_enabled": True,
 }
 
 config = DEFAULT_CONFIG.copy()
 zoom_factor = config["default_zoom"]
+
+# Состояние лупы
 zoom_active = False
 need_zoom = False
-
-# Размеры окна лупы
-MAG_WIDTH = 400
-MAG_HEIGHT = 400
+freeze_active = False
 
 # Дескрипторы Magnifier API
 h_magnifier = None
@@ -93,6 +99,11 @@ user32.SetWindowPos.argtypes = [
 user32.ShowWindow.restype = wintypes.BOOL
 user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
 
+user32.GetForegroundWindow.restype = wintypes.HWND
+
+user32.GetWindowTextW.restype = ctypes.c_int
+user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+
 user32.DestroyWindow.restype = wintypes.BOOL
 user32.DestroyWindow.argtypes = [wintypes.HWND]
 
@@ -108,15 +119,30 @@ class MAGCOLOREFFECT(ctypes.Structure):
 mag_dll.MagSetColorEffect.restype = wintypes.BOOL
 mag_dll.MagSetColorEffect.argtypes = [wintypes.HWND, ctypes.POINTER(MAGCOLOREFFECT)]
 
+mag_dll.MagSetWindowFilterList.restype = wintypes.BOOL
+mag_dll.MagSetWindowFilterList.argtypes = [wintypes.HWND, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(wintypes.HWND)]
+
 # Инициализация лупы
 mag_dll.MagInitialize()
+
+def is_target_window_active():
+    if not config["window_title"]:
+        return True
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return False
+    length = 256
+    buffer = ctypes.create_unicode_buffer(length)
+    user32.GetWindowTextW(hwnd, buffer, length)
+    return config["window_title"].lower() in buffer.value.lower()
 
 def create_hidden_magnifier():
     global h_magnifier
     if h_magnifier:
         return
-    # Двойной размер для каскадного улучшения (опционально)
-    w, h = MAG_WIDTH * 2, MAG_HEIGHT * 2
+
+    size = config["mag_size"]
+    w, h = size * 2, size * 2
     h_magnifier = user32.CreateWindowExW(
         0x8 | 0x20 | 0x80000,  # WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_LAYERED
         "Magnifier", "MagnifierWindow",
@@ -126,6 +152,11 @@ def create_hidden_magnifier():
     )
     # Отключить цветовые эффекты
     mag_dll.MagSetColorEffect(h_magnifier, None)
+
+    # Сглаживание
+    if not config["smoothing_enabled"]:
+        mag_dll.MagSetWindowFilterList(h_magnifier, 0, 0, None)
+
     user32.ShowWindow(h_magnifier, 8)  # SW_SHOWNOACTIVATE
     update_magnifier()
 
@@ -137,12 +168,13 @@ def destroy_magnifier():
 
 def update_magnifier():
     global h_magnifier, zoom_factor
-    if not h_magnifier:
+    if not h_magnifier or freeze_active:
         return
 
+    size = config["mag_size"]
     # Расчет исходного прямоугольника
-    src_w = int(MAG_WIDTH / zoom_factor)
-    src_h = int(MAG_HEIGHT / zoom_factor)
+    src_w = int(size / zoom_factor)
+    src_h = int(size / zoom_factor)
     screen_w = user32.GetSystemMetrics(0)
     screen_h = user32.GetSystemMetrics(1)
     src_x = (screen_w - src_w) // 2
@@ -167,10 +199,11 @@ def update_magnifier():
 def show_magnifier():
     if not h_magnifier:
         create_hidden_magnifier()
+    size = config["mag_size"]
     user32.SetWindowPos(h_magnifier, None,
-        (user32.GetSystemMetrics(0) - MAG_WIDTH) // 2,
-        (user32.GetSystemMetrics(1) - MAG_HEIGHT) // 2,
-        MAG_WIDTH, MAG_HEIGHT, 0x0040)  # SWP_SHOWWINDOW
+        (user32.GetSystemMetrics(0) - size) // 2,
+        (user32.GetSystemMetrics(1) - size) // 2,
+        size, size, 0x0040)  # SWP_SHOWWINDOW
     show_reticle()
 
 def hide_magnifier():
@@ -191,12 +224,14 @@ def create_reticle():
     reticle_window.attributes("-transparentcolor", "black")
     reticle_window.attributes("-alpha", config["reticle_alpha"] / 255.0)
 
+    reticle_window.update_idletasks()
     # Сделать окно сквозным для кликов (WS_EX_TRANSPARENT | WS_EX_LAYERED)
     hwnd = reticle_window.winfo_id()
     style = user32.GetWindowLongW(hwnd, -20)
     user32.SetWindowLongW(hwnd, -20, style | 0x20 | 0x80000)
 
-    canvas = tk.Canvas(reticle_window, width=MAG_WIDTH, height=MAG_HEIGHT,
+    size = config["mag_size"]
+    canvas = tk.Canvas(reticle_window, width=size, height=size,
                        bg="black", highlightthickness=0)
     canvas.pack()
     reticle_window.canvas = canvas
@@ -211,11 +246,21 @@ def draw_reticle():
         return
 
     color = config["reticle_color"]
-    mid_x, mid_y = MAG_WIDTH // 2, MAG_HEIGHT // 2
+    size = config["mag_size"]
+    mid_x, mid_y = size // 2, size // 2
+    r_type = config.get("reticle_type", "cross")
 
-    # Рисуем простой перекрестие
-    canvas.create_line(mid_x - 20, mid_y, mid_x + 20, mid_y, fill=color, width=1)
-    canvas.create_line(mid_x, mid_y - 20, mid_x, mid_y + 20, fill=color, width=1)
+    if r_type == "cross":
+        canvas.create_line(mid_x - 20, mid_y, mid_x + 20, mid_y, fill=color, width=1)
+        canvas.create_line(mid_x, mid_y - 20, mid_x, mid_y + 20, fill=color, width=1)
+    elif r_type == "dot":
+        canvas.create_oval(mid_x - 2, mid_y - 2, mid_x + 2, mid_y + 2, fill=color, outline=color)
+    elif r_type == "circle":
+        canvas.create_oval(mid_x - 10, mid_y - 10, mid_x + 10, mid_y + 10, outline=color, width=1)
+        canvas.create_oval(mid_x - 1, mid_y - 1, mid_x + 1, mid_y + 1, fill=color, outline=color)
+    elif r_type == "t-shape":
+        canvas.create_line(mid_x - 20, mid_y, mid_x + 20, mid_y, fill=color, width=1)
+        canvas.create_line(mid_x, mid_y, mid_x, mid_y + 20, fill=color, width=1)
 
 def show_reticle():
     run_in_tk(_show_reticle_impl)
@@ -226,9 +271,10 @@ def _show_reticle_impl():
     if not reticle_window:
         create_reticle()
 
-    x = (user32.GetSystemMetrics(0) - MAG_WIDTH) // 2
-    y = (user32.GetSystemMetrics(1) - MAG_HEIGHT) // 2
-    reticle_window.geometry(f"{MAG_WIDTH}x{MAG_HEIGHT}+{x}+{y}")
+    size = config["mag_size"]
+    x = (user32.GetSystemMetrics(0) - size) // 2
+    y = (user32.GetSystemMetrics(1) - size) // 2
+    reticle_window.geometry(f"{size}x{size}+{x}+{y}")
     reticle_window.attributes("-alpha", config["reticle_alpha"] / 255.0)
     reticle_window.deiconify()
     reticle_window.lift()
@@ -263,6 +309,7 @@ def reset_zoom():
 
 # ==================== ПЕРЕХВАТ ГОРЯЧИХ КЛАВИШ ====================
 modifier_pressed = False
+active_keys = set()
 
 def get_key_name(key):
     if hasattr(key, 'name'):
@@ -276,22 +323,38 @@ def get_key_name(key):
         return key.char.lower()
     return str(key).replace('Key.', '')
 
+def check_combination(config_key):
+    goal = config.get(config_key, "").lower()
+    if not goal: return False
+
+    parts = set(goal.split('+'))
+    # Если в конфиге просто "f2", а нажато "ctrl+f2", то split('+') даст {"f2"}
+    # Нам нужно проверить, совпадает ли набор нажатых клавиш с требуемым.
+    return parts == active_keys
+
 def on_press(key):
     global modifier_pressed, zoom_active, need_zoom
     key_name = get_key_name(key)
+    active_keys.add(key_name)
 
-    # Проверяем модификатор
+    # Проверяем модификатор (удержание)
     if key_name == config["modifier_key"]:
         modifier_pressed = True
         update_need_zoom()
 
-    # Переключение постоянного зума
-    if key_name == config["toggle_key"].lower():
+    # Переключение постоянного зума (комбинация)
+    if check_combination("toggle_key"):
         toggle_persistent_zoom()
+
+    # Заморозка (комбинация)
+    if check_combination("freeze_key"):
+        toggle_freeze()
 
 def on_release(key):
     global modifier_pressed, zoom_active, need_zoom
     key_name = get_key_name(key)
+    if key_name in active_keys:
+        active_keys.remove(key_name)
 
     if key_name == config["modifier_key"]:
         modifier_pressed = False
@@ -299,7 +362,7 @@ def on_release(key):
 
 def update_need_zoom():
     global need_zoom
-    new_state = zoom_active or modifier_pressed
+    new_state = (zoom_active or modifier_pressed) and is_target_window_active()
     if new_state != need_zoom:
         need_zoom = new_state
         if need_zoom:
@@ -313,7 +376,18 @@ def toggle_persistent_zoom():
     if zoom_active and not h_magnifier:
         create_hidden_magnifier()
     update_need_zoom()
+    if config["audio_enabled"]:
+        winsound.Beep(1000 if zoom_active else 500, 100)
     show_tooltip("Zoom ON" if zoom_active else "Zoom OFF")
+
+def toggle_freeze():
+    global freeze_active
+    if not need_zoom:
+        return
+    freeze_active = not freeze_active
+    if config["audio_enabled"]:
+        winsound.Beep(800 if freeze_active else 600, 100)
+    show_tooltip("FREEZE ON" if freeze_active else "FREEZE OFF")
 
 # Обработчик колеса мыши
 def on_scroll(x, y, dx, dy):
@@ -390,17 +464,25 @@ def start_capture(var_name, btn):
         if k_listener: k_listener.stop()
         if m_listener: m_listener.stop()
 
+    captured_keys = []
+
     def on_cap_key(key):
         global capture_var, capture_button
         if capture_var:
             name = get_key_name(key)
-            config[capture_var] = name
-            run_in_tk(btn.config, text=name)
-            save_config()
-            capture_var = None
-            capture_button = None
-            stop_both()
-            return False
+            if name not in captured_keys:
+                captured_keys.append(name)
+
+            # Если это не модификатор, считаем захват оконченным
+            if name not in ['ctrl', 'shift', 'alt']:
+                final_name = "+".join(captured_keys)
+                config[capture_var] = final_name
+                run_in_tk(btn.config, text=final_name)
+                save_config()
+                capture_var = None
+                capture_button = None
+                stop_both()
+                return False
 
     def on_cap_click(x, y, button, pressed):
         global capture_var, capture_button
@@ -426,45 +508,89 @@ def open_settings():
         return
     settings_window = tk.Toplevel()
     settings_window.title("DayZ Zoom Settings")
-    settings_window.geometry("300x400")
+    settings_window.geometry("400x700")
     settings_window.attributes("-topmost", True)
 
-    # Toggle key
-    ttk.Label(settings_window, text="Toggle Zoom:").pack(pady=5)
-    toggle_btn = ttk.Button(settings_window, text=config["toggle_key"])
-    toggle_btn.pack()
-    toggle_btn.config(command=lambda: start_capture("toggle_key", toggle_btn))
+    canvas = tk.Canvas(settings_window)
+    scrollbar = ttk.Scrollbar(settings_window, orient="vertical", command=canvas.yview)
+    scrollable_frame = ttk.Frame(canvas)
 
-    # Modifier
-    ttk.Label(settings_window, text="Modifier (hold for wheel):").pack(pady=5)
-    mod_btn = ttk.Button(settings_window, text=config["modifier_key"])
-    mod_btn.pack()
-    mod_btn.config(command=lambda: start_capture("modifier_key", mod_btn))
+    scrollable_frame.bind(
+        "<Configure>",
+        lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+    )
 
-    # Reset
-    ttk.Label(settings_window, text="Reset zoom:").pack(pady=5)
-    reset_btn = ttk.Button(settings_window, text=config["reset_key"])
-    reset_btn.pack()
-    reset_btn.config(command=lambda: start_capture("reset_key", reset_btn))
+    canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+    canvas.configure(yscrollcommand=scrollbar.set)
 
-    # Default zoom
-    ttk.Label(settings_window, text="Default zoom:").pack(pady=5)
+    # HOTKEYS
+    ttk.Label(scrollable_frame, text="--- HOTKEYS ---", font=("Arial", 10, "bold")).pack(pady=5)
+
+    for key_cfg, label_text in [("toggle_key", "Toggle Zoom:"),
+                                ("modifier_key", "Modifier (hold for wheel):"),
+                                ("reset_key", "Reset Zoom:"),
+                                ("freeze_key", "Freeze Key:")]:
+        ttk.Label(scrollable_frame, text=label_text).pack()
+        btn = ttk.Button(scrollable_frame, text=config.get(key_cfg, "None"))
+        btn.config(command=lambda k=key_cfg, b=btn: start_capture(k, b))
+        btn.pack(pady=2)
+
+    # MAGNIFIER
+    ttk.Label(scrollable_frame, text="--- MAGNIFIER ---", font=("Arial", 10, "bold")).pack(pady=5)
+
+    ttk.Label(scrollable_frame, text="Default Zoom:").pack()
     zoom_var = tk.DoubleVar(value=config["default_zoom"])
-    zoom_scale = ttk.Scale(settings_window, from_=2.0, to=10.0, variable=zoom_var, orient="horizontal")
-    zoom_scale.pack()
+    ttk.Scale(scrollable_frame, from_=2.0, to=10.0, variable=zoom_var, orient="horizontal").pack()
     zoom_var.trace("w", lambda *a: update_config("default_zoom", zoom_var.get()))
 
-    # Reticle visible
-    reticle_var = tk.BooleanVar(value=config["reticle_visible"])
-    ttk.Checkbutton(settings_window, text="Reticle visible", variable=reticle_var,
-                    command=lambda: update_config("reticle_visible", reticle_var.get())).pack(pady=5)
+    ttk.Label(scrollable_frame, text="Window Size:").pack()
+    size_var = tk.IntVar(value=config["mag_size"])
+    ttk.Scale(scrollable_frame, from_=200, to=800, variable=size_var, orient="horizontal").pack()
+    size_var.trace("w", lambda *a: update_config("mag_size", size_var.get()))
 
-    # Reticle alpha
-    ttk.Label(settings_window, text="Reticle alpha (0-255):").pack(pady=5)
+    ttk.Label(scrollable_frame, text="Target Window Title:").pack()
+    title_entry = ttk.Entry(scrollable_frame)
+    title_entry.insert(0, config["window_title"])
+    title_entry.pack()
+    title_entry.bind("<FocusOut>", lambda e: update_config("window_title", title_entry.get()))
+
+    smooth_var = tk.BooleanVar(value=config["smoothing_enabled"])
+    ttk.Checkbutton(scrollable_frame, text="Smoothing Enabled", variable=smooth_var,
+                    command=lambda: update_config("smoothing_enabled", smooth_var.get())).pack()
+
+    audio_var = tk.BooleanVar(value=config["audio_enabled"])
+    ttk.Checkbutton(scrollable_frame, text="Audio Feedback", variable=audio_var,
+                    command=lambda: update_config("audio_enabled", audio_var.get())).pack()
+
+    # RETICLE
+    ttk.Label(scrollable_frame, text="--- RETICLE ---", font=("Arial", 10, "bold")).pack(pady=5)
+
+    reticle_var = tk.BooleanVar(value=config["reticle_visible"])
+    ttk.Checkbutton(scrollable_frame, text="Reticle Visible", variable=reticle_var,
+                    command=lambda: update_config("reticle_visible", reticle_var.get())).pack()
+
+    ttk.Label(scrollable_frame, text="Reticle Type:").pack()
+    type_var = tk.StringVar(value=config["reticle_type"])
+    type_combo = ttk.Combobox(scrollable_frame, textvariable=type_var, values=["cross", "dot", "circle", "t-shape"])
+    type_combo.pack()
+    type_combo.bind("<<ComboboxSelected>>", lambda e: update_config("reticle_type", type_var.get()))
+
+    ttk.Label(scrollable_frame, text="Reticle Alpha (0-255):").pack()
     alpha_var = tk.IntVar(value=config["reticle_alpha"])
-    alpha_scale = ttk.Scale(settings_window, from_=0, to=255, variable=alpha_var, orient="horizontal")
-    alpha_scale.pack()
+    ttk.Scale(scrollable_frame, from_=0, to=255, variable=alpha_var, orient="horizontal").pack()
     alpha_var.trace("w", lambda *a: update_config("reticle_alpha", alpha_var.get()))
+
+    ttk.Button(scrollable_frame, text="Choose Color",
+               command=lambda: choose_color()).pack(pady=5)
+
+    canvas.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+
+def choose_color():
+    from tkinter import colorchooser
+    color = colorchooser.askcolor(initialcolor=config["reticle_color"])[1]
+    if color:
+        update_config("reticle_color", color)
 
 def update_config(key, value):
     config[key] = value
@@ -478,10 +604,28 @@ def update_config(key, value):
         if need_zoom:
             if value: show_reticle()
             else: hide_reticle()
-    elif key == "reticle_alpha" or key == "reticle_color":
+    elif key == "reticle_alpha" or key == "reticle_color" or key == "reticle_type":
         run_in_tk(draw_reticle)
         if need_zoom:
             run_in_tk(lambda: reticle_window.attributes("-alpha", config["reticle_alpha"] / 255.0) if reticle_window else None)
+    elif key == "smoothing_enabled":
+        if h_magnifier:
+            if value:
+                # Включить сглаживание (по умолчанию)
+                # К сожалению, MagSetWindowFilterList с NULL для сброса фильтра может не работать
+                # как ожидается для включения, но обычно оно включено по умолчанию.
+                # Пересоздание окна - надежный способ.
+                destroy_magnifier()
+            else:
+                mag_dll.MagSetWindowFilterList(h_magnifier, 0, 0, None)
+    elif key == "mag_size":
+        global reticle_window
+        destroy_magnifier()
+        if reticle_window:
+            run_in_tk(lambda: reticle_window.destroy())
+            reticle_window = None
+        if need_zoom:
+            show_magnifier()
     save_config()
 
 # ==================== ТРЕЙ ====================
